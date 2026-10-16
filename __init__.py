@@ -50,6 +50,37 @@ def _imgids_offset(bs, frame, gh, gw, th, tw, device):
     return ids.reshape(1, gh * gw, 3).repeat(bs, 1, 1)
 
 
+REF_POSITIONS = ["aligned (trained)", "beside (right of target)", "bag of features"]
+
+
+def _place_refs(ref_ids, modes, h_, w_):
+    """Reference placement on the h/w RoPE axes (frame axis untouched: refs keep 1..N).
+    aligned (trained): ref token (h, w) sits on target token (h, w) -- how the models were trained.
+    beside: each ref is shifted to the right of the target canvas (and of earlier refs): no h/w overlap,
+            vertical placement and the ref's internal layout unchanged.
+    bag of features (experimental): every token of a ref gets one position (the target's centre), so
+            attention to it is decided by content alone; the ref's layout is discarded.
+    modes: one per ref (a single string applies to all), e.g. scene aligned + subject beside."""
+    if isinstance(modes, str):
+        modes = [modes] * len(ref_ids)
+    out, x0 = [], float(w_)
+    for ids, mode in zip(ref_ids, modes):
+        if mode.startswith("aligned"):
+            out.append(ids)
+            continue
+        ids = ids.clone()
+        if mode.startswith("beside"):
+            ids[..., 2] = ids[..., 2] - ids[..., 2].min() + x0
+            x0 = float(ids[..., 2].max()) + 1.0
+        elif mode.startswith("bag"):
+            ids[..., 1] = (h_ - 1) / 2.0
+            ids[..., 2] = (w_ - 1) / 2.0
+        else:
+            raise ValueError(f"unknown ref_position {mode!r}")
+        out.append(ids)
+    return out
+
+
 def _to_4d(v):
     """(B,C,T,H,W) -> (B*T,C,H,W); pass 4D through. Images use T=1."""
     if v.ndim == 5:
@@ -170,7 +201,8 @@ def _ref_attn_bias(boosts, boost_mask, txtlen, slens, tgtlen, mask_hw, device, d
 
 def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options,
                        ref_boost=1.0, ref_boost_a=1.0, ref_boost_mask=None,
-                       ref_native=False, pos_mode="anchor"):
+                       ref_native=False, pos_mode="anchor", ref_position="aligned (trained)",
+                       ref_position_a="aligned (trained)"):
     """Krea2 SingleStreamDiT._forward, but with source block(s) prepended.
 
     m           : the SingleStreamDiT (LoRA-patched at sample time)
@@ -229,6 +261,9 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
                    for i, (gh, gw) in enumerate(src_grids)]
     else:
         ref_ids = [_imgids(bs, i + 1, gh, gw, device) for i, (gh, gw) in enumerate(src_grids)]
+    # per-ref placement, same convention as ref_boost/ref_boost_a: last ref = subject (ref_position),
+    # earlier refs = scene (ref_position_a)
+    ref_ids = _place_refs(ref_ids, [ref_position_a] * (len(ref_ids) - 1) + [ref_position], h_, w_)
     pos = torch.cat([
         torch.zeros(bs, txtlen, 3, device=device, dtype=torch.float32)]   # text @ 0
         + ref_ids
@@ -278,6 +313,11 @@ class Krea2EditModelPatch:
             # declared last on purpose: appending keeps every existing socket index put,
             # so workflows saved before this input still reload with their links intact.
             "target_latent": ("LATENT", {"tooltip": "RECOMMENDED with vae + source_image: wire the SAME latent you feed KSampler.latent_image. Lets the node VAE-encode the source here, before sampling starts, instead of on the first step — otherwise the VAE is pulled onto the GPU mid-sampling and can evict part of the diffusion model, slowing every remaining step on VRAM-tight setups"}),
+            # appended last, same reason as target_latent
+            "ref_position": (REF_POSITIONS, {"default": REF_POSITIONS[0],
+                             "tooltip": "where the LAST reference (the person in two-image workflows, or the only image) sits in position space. aligned (trained) = pinned onto the output layout, how the models were trained (default). beside = placed next to the canvas: identity still flows but the layout pin is gone, so the person can be restaged more freely. bag of features = experimental, content without layout"}),
+            "ref_position_a": (REF_POSITIONS, {"default": REF_POSITIONS[0],
+                               "tooltip": "the same choice for the FIRST reference (the scene in two-image workflows); no effect with a single image. For putting a person into a scene: scene aligned + person beside"}),
         }}
 
     RETURN_TYPES = ("MODEL",)
@@ -287,12 +327,16 @@ class Krea2EditModelPatch:
 
     def patch(self, model, source_latent, source_latent_b=None, ref_boost=1.0, ref_boost_a=1.0,
               ref_boost_mask=None, vae=None, source_image=None,
-              source_image_b=None, fit_mode="fit", target_latent=None, **_future):
+              source_image_b=None, fit_mode="fit", target_latent=None,
+              ref_position="aligned (trained)", ref_position_a="aligned (trained)", **_future):
         if _future:
             print(f"[krea2edit] WARNING: workflow provides inputs this node version does not "
                   f"know ({', '.join(sorted(_future))}). The workflow is newer than the "
                   f"installed node pack. Update comfyui-krea2edit (Manager -> Update, or git "
                   f"pull) and restart ComfyUI. Continuing without them.", flush=True)
+        if not (ref_position.startswith("aligned") and ref_position_a.startswith("aligned")):
+            print(f"[krea2edit] reference placement: last ref={ref_position!r}, "
+                  f"first ref={ref_position_a!r}", flush=True)
         m = model.clone()
         # The target latent reaches the diffusion model already scaled (process_latent_in);
         # scale the source(s) the same way so all share one latent space.
@@ -370,7 +414,8 @@ class Krea2EditModelPatch:
                                    ref_boost_mask=ref_boost_mask,
                                    ref_native=(fit_mode == "fit" and vae is not None
                                                and source_image is not None),
-                                   pos_mode=("stride1" if fit_mode == "fit" else "anchor"))
+                                   pos_mode=("stride1" if fit_mode == "fit" else "anchor"),
+                                   ref_position=ref_position, ref_position_a=ref_position_a)
             return v
 
         to = m.model_options.setdefault("transformer_options", {})

@@ -4,6 +4,28 @@ Weights: https://huggingface.co/conradlocke/krea2-identity-edit
 v1.2 updates the **nodes** (see below); they stay backward-compatible with v1/v1.1
 weights via `fit_mode: crop`.
 
+## v2.0.0 — Krea 2 Identity Edit V2 + Krea 2 General Edit V2
+
+V2 ships as two LoRAs (weights on Hugging Face):
+- `krea2_identity_edit_v2.safetensors` — **Krea 2 Identity Edit V2**: restage a person from one
+  photo into any scene, pose, outfit and lighting. Extremely improved likeness, better sharpness
+  and textures.
+- `krea2_general_edit_v2.safetensors` — **Krea 2 General Edit V2**: instruction-based editing
+  (remove, recolor, relight, backgrounds, add objects, text, outfits, restyles, flat lays).
+
+Use one LoRA per task; loading both at 1.0 breaks the image (~0.6 each if combined).
+
+### Added
+- **Reference placement** on `Krea2EditModelPatch` — two new inputs, appended last so saved
+  workflows keep their links; defaults reproduce the previous behavior exactly:
+  - `ref_position` places the **last** reference (the person in two-image workflows, or the only image).
+  - `ref_position_a` places the **first** reference (the scene).
+  - Options: `aligned (trained)` (default; the reference is pinned onto the output layout),
+    `beside (right of target)` (the reference sits next to the canvas in RoPE space — identity
+    still flows, the layout pin is gone, so the person restages more freely), and the experimental
+    `bag of features` (all tokens of a reference share one position).
+  - Recommended for compositing a person into a scene: scene `aligned` + person `beside`.
+
 ## v1.2.5 — 2026-07-29
 
 ### Added

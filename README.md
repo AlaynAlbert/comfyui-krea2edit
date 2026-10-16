@@ -11,8 +11,11 @@ into the Qwen3-VL text encoder (semantic grounding), matching how the LoRA was t
 
 ## Model versions
 
-See [CHANGELOG.md](CHANGELOG.md) — **v1.2 is recommended** (better face likeness,
-plus the new `fit` reference geometry and `ref_boost` fidelity dial).
+**V2 (recommended)** ships as two LoRAs — **Krea 2 Identity Edit V2**
+(`krea2_identity_edit_v2.safetensors`, restage a person from one photo) and **Krea 2 General
+Edit V2** (`krea2_general_edit_v2.safetensors`, instruction-based editing). Use one per task.
+The V2 nodes add **reference placement** (`ref_position` / `ref_position_a`). Older weights
+keep working with these nodes. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Installation
 
@@ -24,7 +27,8 @@ git clone https://github.com/lbouaraba/comfyui-krea2edit
 
 Requirements: a ComfyUI version with native Krea 2 support, the Krea 2 model
 (Raw or Turbo), the Qwen3-VL 4B text encoder used by Krea 2, and the Krea 2 Identity Edit
-LoRA (`krea2_identity_edit_v1_2.safetensors`). No extra Python dependencies.
+LoRAs (`krea2_identity_edit_v2.safetensors` and/or `krea2_general_edit_v2.safetensors`).
+No extra Python dependencies.
 
 ## Nodes
 
@@ -47,6 +51,12 @@ in-context tokens (RoPE frame 1). Inputs:
   the v1/v1.1-legacy geometry (use with older weights).
 - `ref_boost` *(default 1.0)* — reference-fidelity dial; >1 pulls harder toward the
   reference's appearance, <1 loosens. `ref_boost_a` is the same dial for the scene ref in two-ref edits.
+- `ref_position` *(default `aligned (trained)`)* — where the **last** reference (the person,
+  or the only image) sits in position space. `aligned` pins it onto the output layout (how the
+  models were trained); `beside (right of target)` places it next to the canvas, so identity
+  still flows but the layout pin is gone and the person can be restaged more freely;
+  `bag of features` is experimental. `ref_position_a` is the same choice for the **first**
+  reference (the scene). For putting a person into a scene: scene `aligned`, person `beside`.
 
 ### `Krea2EditGroundedEncode`
 Image-grounded instruction encoding — the text encoder *sees* the image while
