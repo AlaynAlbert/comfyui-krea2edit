@@ -167,7 +167,8 @@ def _fit_encode_image(image, vae, H, W, cache, key, fit_mode="crop"):
     return lat
 
 
-def _ref_attn_bias(boosts, boost_mask, txtlen, slens, tgtlen, mask_hw, device, dtype):
+def _ref_attn_bias(boosts, boost_mask, txtlen, slens, tgtlen, mask_hw, device, dtype,
+                   boost_out=1.0):
     """Additive attention-logit bias on the [text | refs... | target] sequence.
 
     boosts: per-ref factor on target->ref attention, aligned with the source blocks
@@ -175,6 +176,13 @@ def _ref_attn_bias(boosts, boost_mask, txtlen, slens, tgtlen, mask_hw, device, d
     multiplying those keys' post-softmax attention weight before renormalization.
     boost_mask (ComfyUI MASK, ref-image pixel space) restricts the LAST ref's boost
     to a region (e.g. the face).
+    boost_out: factor for the LAST ref's tokens OUTSIDE boost_mask. Default 1.0 keeps
+    the historical behaviour, where the mask only ADDS boost on its own region and
+    everything else stays neutral -- note that "neutral" is 1.0, which is HIGHER than
+    a typical global ref_boost of 0.65, so a masked run leaks MORE of the reference's
+    body/clothing than an unmasked one at 0.65. Set boost_out < 1 to suppress the
+    reference outside the mask, which is what actually decouples "pull the face"
+    from "copy the body".
     """
     nsrc = len(slens)
     offs = [txtlen]
@@ -184,25 +192,33 @@ def _ref_attn_bias(boosts, boost_mask, txtlen, slens, tgtlen, mask_hw, device, d
     L = rows0 + tgtlen
     bias = torch.zeros(1, 1, L, L, device=device, dtype=dtype)
     for i, b in enumerate(boosts):
-        if b == 1.0:
+        masked = (boost_mask is not None and i == nsrc - 1 and mask_hw is not None)
+        b_out = boost_out if masked else 1.0
+        # b == 1.0 alone is NOT enough to skip: with a mask and b_out != 1.0 the ref
+        # still needs its outside-the-mask region biased.
+        if b == 1.0 and b_out == 1.0:
             continue
         off, sl = offs[i], slens[i]
-        if boost_mask is not None and i == nsrc - 1 and mask_hw is not None:
+        if masked:
             mask = boost_mask[:1]
             if mask.ndim == 2:
                 mask = mask[None]
             mask = F.interpolate(mask[None].float(), size=mask_hw[i], mode="area")[0, 0]
             cols = off + torch.nonzero(mask.reshape(-1) > 0.5, as_tuple=True)[0].to(device)
+            if b_out != 1.0:
+                # whole ref first, then the masked region overwrites it below
+                bias[:, :, rows0:, off:off + sl] = math.log(max(b_out, 1e-4))
         else:
             cols = torch.arange(off, off + sl, device=device)
-        bias[:, :, rows0:, cols] = math.log(max(b, 1e-4))
+        if b != 1.0 or masked:
+            bias[:, :, rows0:, cols] = math.log(max(b, 1e-4))
     return bias
 
 
 def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options,
                        ref_boost=1.0, ref_boost_a=1.0, ref_boost_mask=None,
-                       ref_native=False, pos_mode="anchor", ref_position="aligned (trained)",
-                       ref_position_a="aligned (trained)"):
+                       ref_native=False, pos_mode="anchor", ref_boost_out=1.0,
+                       ref_position="aligned (trained)", ref_position_a="aligned (trained)"):
     """Krea2 SingleStreamDiT._forward, but with source block(s) prepended.
 
     m           : the SingleStreamDiT (LoRA-patched at sample time)
@@ -272,12 +288,13 @@ def krea2_edit_forward(m, x, timesteps, context, src_latent, transformer_options
     freqs = m.pe_embedder(pos)
 
     attn_bias = None
-    if ref_boost != 1.0 or ref_boost_a != 1.0:
+    if ref_boost != 1.0 or ref_boost_a != 1.0 or ref_boost_out != 1.0:
         # last ref = subject (single-ref: the only ref); earlier refs (scene) get ref_boost_a
         boosts = [ref_boost_a] * (len(src_imgs) - 1) + [ref_boost]
         attn_bias = _ref_attn_bias(boosts, ref_boost_mask, txtlen,
                                    [si.shape[1] for si in src_imgs], tgtlen,
-                                   src_grids, combined.device, combined.dtype)
+                                   src_grids, combined.device, combined.dtype,
+                                   boost_out=ref_boost_out)
 
     for block in m.blocks:
         combined = block(combined, tvec, freqs, attn_bias, transformer_options=transformer_options)
@@ -318,6 +335,8 @@ class Krea2EditModelPatch:
                              "tooltip": "where the LAST reference (the person in two-image workflows, or the only image) sits in position space. aligned (trained) = pinned onto the output layout, how the models were trained (default). beside = placed next to the canvas: identity still flows but the layout pin is gone, so the person can be restaged more freely. bag of features = experimental, content without layout"}),
             "ref_position_a": (REF_POSITIONS, {"default": REF_POSITIONS[0],
                                "tooltip": "the same choice for the FIRST reference (the scene in two-image workflows); no effect with a single image. For putting a person into a scene: scene aligned + person beside"}),
+            "ref_boost_out": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1000.0, "step": 0.01, "round": 0.001,
+                                        "tooltip": "companion to ref_boost_mask: the dial for the LAST ref OUTSIDE the mask (ref_boost applies INSIDE it). 1.0 = off, historical behaviour — the mask only ADDS boost on its region and the rest stays neutral. Careful: neutral 1.0 is HIGHER than a typical global ref_boost of 0.65, so a masked run leaks MORE of the reference's body/clothing than an unmasked one. Set <1 (e.g. 0.65) to boost the face AND suppress the body at the same time. No effect without ref_boost_mask"}),
         }}
 
     RETURN_TYPES = ("MODEL",)
@@ -328,7 +347,12 @@ class Krea2EditModelPatch:
     def patch(self, model, source_latent, source_latent_b=None, ref_boost=1.0, ref_boost_a=1.0,
               ref_boost_mask=None, vae=None, source_image=None,
               source_image_b=None, fit_mode="fit", target_latent=None,
-              ref_position="aligned (trained)", ref_position_a="aligned (trained)", **_future):
+              ref_boost_out=1.0, ref_position="aligned (trained)",
+              ref_position_a="aligned (trained)", **_future):
+        if ref_boost_out != 1.0 and ref_boost_mask is None:
+            print(f"[krea2edit] WARNING: ref_boost_out={ref_boost_out} has NO EFFECT without "
+                  f"'ref_boost_mask' connected — there is no 'outside the mask' to bias. "
+                  f"Use ref_boost for a global dial.", flush=True)
         if _future:
             print(f"[krea2edit] WARNING: workflow provides inputs this node version does not "
                   f"know ({', '.join(sorted(_future))}). The workflow is newer than the "
@@ -412,6 +436,7 @@ class Krea2EditModelPatch:
             v = krea2_edit_forward(dm, x, timesteps, context, src, transformer_options,
                                    ref_boost=ref_boost, ref_boost_a=ref_boost_a,
                                    ref_boost_mask=ref_boost_mask,
+                                   ref_boost_out=ref_boost_out,
                                    ref_native=(fit_mode == "fit" and vae is not None
                                                and source_image is not None),
                                    pos_mode=("stride1" if fit_mode == "fit" else "anchor"),
