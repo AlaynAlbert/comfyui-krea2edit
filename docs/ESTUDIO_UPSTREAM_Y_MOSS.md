@@ -278,3 +278,44 @@ No trae mejoras del nodo. Lo útil son **guardas de datos** que aplican tal cual
    - 16 renders, unos 20 min de GPU.
    - Si E-1,5 o E-2,5 gana, se completa a 6 pares. Si no, el `ref_boost` en MOSS queda
      descartado y el parecido tiene que venir del entrenamiento.
+
+## 8. Validación local (30-10-2026, máquina del usuario, RTX 5070 Ti)
+
+Lo hizo el agente local siguiendo `docs/PRERREGISTRO_MOSS_REF_BOOST.md`. Run: `utilidades/runs/moss_image/20261029_ref_boost_piloto/` (LEEME, manifest, medidas y hoja).
+
+### 8.1 Tests (python de ComfyUI 3.13, torch 2.9.1+cu130)
+
+| test | resultado |
+|---|---|
+| `tests/test_ref_attn_bias.py` | 12/12 |
+| `tests/test_pre_encode.py` | 5/5 |
+| `tests/test_wrapper_signature.py` (desde la copia instalada en `custom_nodes`, que necesita comfy) | 2/2 |
+| `tests/test_moss_ref_boost.py` | 36 OK |
+| `tests/mutar_moss_ref_boost.py` | 12/12 cazadas |
+
+**No se encontró ningún fallo del prototipo**: no hubo que tocar el código.
+
+### 8.2 Datos de la LoRA de edición v1 (§2.1)
+
+Pasan las dos comprobaciones:
+- emparejado por nombre: 454/454, sin referencias huérfanas ni con varias extensiones;
+- `flip_x`/`flip_y` a `false`, tanto en el yaml sellado como en el `config.yaml` que guardó ai-toolkit.
+
+El «identidad no» de la v1 **no tiene una causa de datos**.
+
+### 8.3 En GPU (ComfyUI `fd7639f47`, `--use-ck-attention`, Ostris `8f9b50c` + `_pe`)
+
+- **Nodo inerte.** E0 toma 1, sin el nodo y con el nodo a 1,0: el mismo sha.
+- **Compuerta extra.** El control de bytes no demuestra que el sesgo actúe, así que se añadió una: E-2,5 toma 1 da otro sha. El override llega a la atención con ck-attention, sin avisos.
+- **Coste.** 52,6–56,9 s por render con sesgo, frente a 42,5–45,8 s del control: **1,30×**, dentro del +10–30 % estimado en §4.3. VRAM pico de 15,2 GB, sin OOM. No hace falta portar el «split» de #31.
+- **Resultado del piloto** (juzgado con la regla §5; el voto humano queda como validación):
+  - **E-2,5:** global 1 de 6 y ArcFace a la vara 0,548 frente a 0,555 del control → **no hay «mejora»**.
+  - **E-1,5:** casi idéntica al control.
+  - **S-0,65:** parado.
+  - Lectura §7: **`ref_boost` descartado en MOSS para el parecido**, y H1 descartada.
+
+### 8.4 Observaciones (no son fallos del código)
+
+- **§5 / H1: la premisa no se da con la ref a 512².** El «repinta 6/6» del 21-10 se midió con la referencia a ~1 MP (`FluxKontextImageScale`). Con la ref a 512² que fija el §3, S0 ya no repinta: sigue la escena 2 de 3, con otra cara.
+- **§4.3: atención preferida.** Con `--use-ck-attention` y los pesos convrot int8, el sesgo actúa y no hay avisos. Sigue sin verificarse con pesos que declaren `ComfyAttention`.
+- **§6: el kernel con máscara cambia los bytes**, pero en las tomas e3, e4 y e8 las diferencias a ojo frente al control son mínimas. Con la LoRA v1, a 1,5 la diferencia apenas se ve.
